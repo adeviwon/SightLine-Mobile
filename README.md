@@ -1,5 +1,20 @@
 # SightLine Mobile — Offline Document Reader for iPhone
 
+## ▶︎ RUN ME (iPhone install in 4 steps)
+
+```bash
+git clone https://github.com/adeviwon/SightLine-Mobile.git
+cd SightLine-Mobile
+bash serve.sh
+```
+
+Then on your iPhone (same Wi-Fi): open the printed URL in Safari →
+**Share → Add to Home Screen** → wait for `ENGINE: READY` → done.
+Airplane mode works forever after.
+
+---
+
+
 > **Your eyes, offline. Nothing leaves your phone.**
 
 A fully offline PWA (Progressive Web App) that scans banking documents, medical
