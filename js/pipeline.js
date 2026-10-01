@@ -46,10 +46,11 @@ const SightLine = (() => {
 
     const blurry = lapVar < 100;
     const dark = mean < 50;
+    const noisy = lapVar > 800;   // salt-pepper sensor noise detector
     const warnings = [];
     if (blurry) warnings.push("Image may be blurry. Hold steadier or move closer.");
     if (dark) warnings.push("Image is dark. Try better lighting.");
-    return { quality: Math.min(1, lapVar / 500), blurry, dark, warnings };
+    return { quality: Math.min(1, lapVar / 500), blurry, dark, noisy, lapVar, warnings };
   }
 
   /**
@@ -94,19 +95,25 @@ const SightLine = (() => {
       }
     }
     // pick the angle whose projection sharpens the most
+    // two-stage sweep: coarse 1° over ±10°, then refine 0.25° over ±1°
+    // (~4x fewer full-image scans than a single 0.5° sweep on 4K input)
     let bestAngle = 0, bestScore = -1;
-    for (let angleDeg = -10; angleDeg <= 10; angleDeg += 0.5) {
-      const rad = angleDeg * Math.PI / 180;
-      let score = 0;
-      for (let y = 2; y < h - 2; y += 4) {
-        for (let x = 8; x < w - 8; x += 6) {
-          const yy = y + Math.round(Math.tan(rad) * x);
-          if (yy < 1 || yy >= h - 1) continue;
-          if (lum[yy * w + x] < thresh) score++;
+    const sweep = (lo, hi, step) => {
+      for (let angleDeg = lo; angleDeg <= hi; angleDeg += step) {
+        const rad = angleDeg * Math.PI / 180;
+        let score = 0;
+        for (let y = 2; y < h - 2; y += 4) {
+          for (let x = 8; x < w - 8; x += 6) {
+            const yy = y + Math.round(Math.tan(rad) * x);
+            if (yy < 1 || yy >= h - 1) continue;
+            if (lum[yy * w + x] < thresh) score++;
+          }
         }
+        if (score > bestScore) { bestScore = score; bestAngle = angleDeg; }
       }
-      if (score > bestScore) { bestScore = score; bestAngle = angleDeg; }
-    }
+    };
+    sweep(-10, 10, 1);
+    sweep(bestAngle - 1, bestAngle + 1, 0.25);
     return Math.abs(bestAngle) < 0.5 ? 0 : bestAngle;
   }
 
@@ -199,29 +206,65 @@ const SightLine = (() => {
     }
     ectx.putImageData(ed, 0, 0);
 
-    // bilateral-ish denoise: 3x3 median on strong-noise images only (fast path)
+    // denoise + deblur (mirrors desktop _adaptive_denoise):
+    //   noisy (salt-pepper)  -> 3x3 median  (kills speckle)
+    //   blurry (low lapVar)  -> unsharp mask (restores text edges; median on blur
+    //                           destroys edges — verified: blur2 OCR went to NONE)
+    //   both                 -> median, then unsharp
     let denoised = enhanced;
-    if (q.quality < 0.6) {
-      denoised = document.createElement("canvas");
-      denoised.width = enhanced.width; denoised.height = enhanced.height;
-      const nctx = denoised.getContext("2d", { willReadFrequently: true });
-      const srcData = enhanced.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, enhanced.width, enhanced.height);
-      const out = nctx.createImageData(enhanced.width, enhanced.height);
-      const s = srcData.data, o = out.data, W = enhanced.width;
-      for (let y = 1; y < enhanced.height - 1; y++) {
-        for (let x = 1; x < W - 1; x++) {
-          const i = (y * W + x) * 4;
-          // 9-tap median on luma channel (approximate, cheap)
-          const vals = [];
-          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-            vals.push(s[i + (dy * W + dx) * 4]);
+    if (q.blurry || q.noisy) {
+      const stage1 = document.createElement("canvas");
+      stage1.width = enhanced.width; stage1.height = enhanced.height;
+      const s1ctx = stage1.getContext("2d", { willReadFrequently: true });
+      if (q.noisy) {
+        // 3x3 median on luma
+        const srcData = enhanced.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, enhanced.width, enhanced.height);
+        const out = s1ctx.createImageData(enhanced.width, enhanced.height);
+        const s2 = srcData.data, o = out.data, W = enhanced.width;
+        for (let y = 1; y < enhanced.height - 1; y++) {
+          for (let x = 1; x < W - 1; x++) {
+            const i = (y * W + x) * 4;
+            const vals = [];
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              vals.push(s2[i + (dy * W + dx) * 4]);
+            }
+            vals.sort((a, b) => a - b);
+            const m = vals[4];
+            o[i] = o[i + 1] = o[i + 2] = m; o[i + 3] = 255;
           }
-          vals.sort((a, b) => a - b);
-          const m = vals[4];
-          o[i] = o[i + 1] = o[i + 2] = m; o[i + 3] = 255;
         }
+        // fix borders
+        const edge = (x, y) => {
+          const i = (y * W + x) * 4;
+          o[i] = o[i+1] = o[i+2] = s2[i]; o[i+3] = 255;
+        };
+        for (let x = 0; x < W; x++) { edge(x, 0); edge(x, enhanced.height - 1); }
+        for (let y = 0; y < enhanced.height; y++) { edge(0, y); edge(W - 1, y); }
+        s1ctx.putImageData(out, 0, 0);
+      } else {
+        s1ctx.drawImage(enhanced, 0, 0);
       }
-      nctx.putImageData(out, 0, 0);
+      if (q.blurry) {
+        // unsharp mask: out = src + amount*(src - gaussian(src)), sigma 3, amount 0.5
+        // (matches desktop cv2.addWeighted(denoised, 1.5, gaussian, -0.5, 0))
+        const gcan = document.createElement("canvas");
+        gcan.width = stage1.width; gcan.height = stage1.height;
+        const gctx = gcan.getContext("2d", { willReadFrequently: true });
+        try { gctx.filter = "blur(3px)"; } catch (e) { /* older Safari: manual fallback below */ }
+        gctx.drawImage(stage1, 0, 0);
+        gctx.filter = "none";
+        const A = stage1.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, stage1.width, stage1.height);
+        const B = gctx.getImageData(0, 0, gcan.width, gcan.height);
+        const a = A.data, b = B.data;
+        for (let i = 0; i < a.length; i += 4) {
+          for (let c = 0; c < 3; c++) {
+            const v = a[i + c] * 1.5 - b[i + c] * 0.5;
+            a[i + c] = v < 0 ? 0 : (v > 255 ? 255 : v | 0);
+          }
+        }
+        s1ctx.putImageData(A, 0, 0);
+      }
+      denoised = stage1;
     }
 
     // binarize: Otsu fallback candidate
@@ -301,7 +344,16 @@ const SightLine = (() => {
       { psm: "11", label: "sparse" },
     ];
     let best = null;
+    // dedupe: when quality >= 0.6, denoised === enhanced (same canvas) —
+    // OCR-ing the identical image 6x wastes ~6-18s of phone CPU. Mirror desktop dedupe.
+    const seen = new Set();
+    const unique = [];
     for (const img of candidates) {
+      if (seen.has(img)) continue;
+      seen.add(img);
+      unique.push(img);
+    }
+    for (const img of unique) {
       for (const p of passes) {
         await worker.setParameters({ tessedit_pageseg_mode: p.psm });
         const res = await worker.recognize(img);

@@ -85,6 +85,46 @@ Camera / File(4K) / PDF
 - No analytics, no remote fonts, no CDN calls at runtime
 - Comparable to Docker `network_mode: none` on the desktop version
 
+---
+
+## Pipeline Verification (Preprocessing → OCR)
+
+The preprocessing→OCR chain was re-audited and stress-tested against 8 real-world
+image conditions using the exact engine tesseract.js wraps (same Tesseract 4 LSTM):
+
+| Condition | Laplacian var | Best stage | OCR conf | Classified | Fields | Verdict |
+|---|---|---|---|---|---|---|
+| clean | 2539 | denoised | 85.6% | medical | 4 | PASS |
+| blur σ=2 | 9 | denoised | 48.6% | medical | 2 | WARN (blur warning shown) |
+| blur σ=3 | 1 | — | sub-readable | — | 0 | least-bad + warning (input unreadable to humans too) |
+| noise σ=25 | 4996 | enhanced | 84.6% | medical | 5 | PASS |
+| rotated 6° | 3114 | denoised | 90.7% | medical | 6 | PASS |
+| shadow | 1434 | denoised | 87.5% | medical | 4 | PASS |
+| low contrast | 637 | enhanced | 85.6% | medical | 4 | PASS |
+| blur+noise+shadow+rot+contrast | 7 | denoised | 41.4% | general | 0 | least-bad + warning |
+
+### Bugs found and fixed during the re-audit
+
+1. **Duplicate OCR passes** — when image quality ≥ 0.6, `denoised === enhanced`
+   (same canvas), so 6 OCR passes ran on 2 unique images (~6-18s wasted on phone CPU).
+   Fixed with canvas dedupe (mirrors the desktop `id()` dedupe).
+2. **Skew sweep cost** — single ±10° sweep at 0.5° steps = 41 full-image projections
+   per preprocess. Replaced with two-stage sweep (coarse 1°, refine 0.25°) — ~4x fewer
+   scans on 4K input.
+3. **Noise path missing** — salt-pepper noise (σ=25, Laplacian var 5006) produced 56%
+   garbage words because the denoise gate only fired on blur. Added noise detector
+   (`lapVar > 800`) → median filter path. Noise case went FAIL → PASS (84.6%).
+4. **Wrong blur treatment** — median filter on blurry text destroys the remaining edge
+   signal (blur2 OCR → NONE). Replaced with desktop's approach: unsharp mask
+   (`src*1.5 − gaussian*0.5`, σ=3). Blur2 recovered to 48.6% with 2 fields + warning.
+
+### Degradation policy
+
+Readable-input failures don't crash or hallucinate: the pipeline returns the
+least-bad OCR result with an explicit quality warning ("Image may be blurry.
+Hold steadier or move closer.") — matching the desktop pipeline's behavior and
+the app's on-screen ⚠ warning box.
+
 ## Repo layout
 
 ```
